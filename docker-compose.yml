@@ -1,12 +1,12 @@
 services:
-  waveform:
+  waveform-a: &waveform-service
     build: .
     image: waveform-handover:latest
-    ports:
-      - "8000:8000"
     environment:
       WAVEFORM_DB: /data/waveform.db
     volumes:
+      # 两个实例挂载同一个命名卷、同一个 SQLite 文件:
+      # 写入经 BEGIN IMMEDIATE 跨进程串行,读取走 WAL 快照互不阻塞
       - waveform-data:/data
     restart: unless-stopped
     healthcheck:
@@ -14,6 +14,13 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    ports:
+      - "8000:8000"
+
+  waveform-b:
+    <<: *waveform-service
+    ports:
+      - "8001:8000"
 
 volumes:
   waveform-data:

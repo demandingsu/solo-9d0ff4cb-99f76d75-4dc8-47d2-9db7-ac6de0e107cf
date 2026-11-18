@@ -12,10 +12,12 @@
 
 ```bash
 docker compose up --build
-# 打开 http://localhost:8000
+# 实例 A: http://localhost:8000   实例 B: http://localhost:8001
 ```
 
-SQLite 数据保存在命名卷 `waveform-data` 中。
+两个服务实例(`waveform-a`/`waveform-b`)挂载同一个命名卷、打开同一个
+SQLite 文件,模拟"一台查旧片段、另一台补齐发布"的双实例部署。SQLite 数据
+保存在命名卷 `waveform-data` 中。
 
 ### 本地开发
 
@@ -53,8 +55,15 @@ STA1,1769040001000,2,3,-3 0 4 ...
 - **窗过期**:补传使现役窗的有效样点发生变化时,该窗立即标为
   `stale`(过期),拾取接口不再将其当作现役;重新发布成功才替换,
   发布失败保留过期旧窗。
-- **一致性**:上传、发布、读取共用一把写锁与显式事务
-  (`BEGIN IMMEDIATE`),交错执行时每个请求看到的都是同一已提交状态。
+- **一致性(支持多实例共享同一 SQLite 文件)**:
+  - 写事务(上传、发布)一律 `BEGIN IMMEDIATE`,跨进程靠 SQLite 文件写锁
+    串行化,配合 `busy_timeout` 等待而不是直接报 `SQLITE_BUSY`;
+  - 读请求(缺口列表、窗口详情、拾取、台站列表)整体包在**单个延迟读事务**
+    里,只含 SELECT:WAL 模式下读不阻塞写——查询期间其他实例仍可上传与
+    发布;同时一次请求内的所有 SELECT 锚定同一个快照,缺口统计、有效样点
+    与逐样点来源轮次、窗状态与版本必然来自同一个已提交状态,不会出现
+    "现役窗只有 500 点"这类新旧状态混报;补传使现役窗过期时,详情要么
+    报旧快照(active + 旧样点),要么报新快照(stale + 新样点),不混合。
 
 ## HTTP API
 
@@ -95,9 +104,9 @@ curl -s http://localhost:8000/api/picking/STA1/1700000000000
 ```
 app/
   core.py            # 解析、冲突校验、有效样点合成、上传/发布事务
-  db.py              # SQLite 单连接 + 锁,建表
+  db.py              # SQLite 单连接 + 锁,读/写事务上下文管理器,建表
   main.py            # FastAPI 路由与网页挂载
   static/index.html  # 操作网页(上传/缺口浏览/发布/拾取视图)
-tests/test_waveform.py  # 21 条自测:重叠、补传、幂等、原子性、交错一致性
+tests/test_waveform.py  # 25 条自测:重叠、补传、幂等、原子性、单进程与跨实例(跨连接)交错一致性
 Dockerfile  docker-compose.yml  requirements*.txt
 ```

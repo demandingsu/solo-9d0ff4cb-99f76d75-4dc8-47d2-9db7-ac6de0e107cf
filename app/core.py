@@ -248,43 +248,37 @@ def upload_csv(db, text: str) -> dict:
     uniq = list(by_key.values())
     _check_overlap_in_batch(uniq)
 
-    with db.lock:
-        conn = db.conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            to_insert = []
-            for s in uniq:
-                row = conn.execute(
-                    "SELECT content_hash FROM segments "
-                    "WHERE station=? AND round=? AND segment_no=?",
-                    (s.station, s.round, s.segment_no)).fetchone()
-                if row is None:
-                    to_insert.append(s)
-                elif row["content_hash"] != s.content_hash():
-                    raise BatchRejected(
-                        f"与已存片段同轮同号但内容不同: 台站{s.station} "
-                        f"轮次{s.round} 片段号{s.segment_no}")
-                # 同轮同号同内容:幂等跳过,不重复入库
-            _check_overlap_vs_db(conn, to_insert)
+    with db.write_transaction() as conn:
+        to_insert = []
+        for s in uniq:
+            row = conn.execute(
+                "SELECT content_hash FROM segments "
+                "WHERE station=? AND round=? AND segment_no=?",
+                (s.station, s.round, s.segment_no)).fetchone()
+            if row is None:
+                to_insert.append(s)
+            elif row["content_hash"] != s.content_hash():
+                raise BatchRejected(
+                    f"与已存片段同轮同号但内容不同: 台站{s.station} "
+                    f"轮次{s.round} 片段号{s.segment_no}")
+            # 同轮同号同内容:幂等跳过,不重复入库
+        _check_overlap_vs_db(conn, to_insert)
 
-            now = _utc_now_iso()
-            for s in to_insert:
-                conn.execute(
-                    "INSERT INTO segments(station,round,segment_no,start_ms,n,"
-                    "samples,content_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (s.station, s.round, s.segment_no, s.start_ms, s.n,
-                     _dumps(s.samples), s.content_hash(), now))
+        now = _utc_now_iso()
+        for s in to_insert:
+            conn.execute(
+                "INSERT INTO segments(station,round,segment_no,start_ms,n,"
+                "samples,content_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (s.station, s.round, s.segment_no, s.start_ms, s.n,
+                 _dumps(s.samples), s.content_hash(), now))
 
-            stale = _mark_stale_windows(conn, to_insert)
-            conn.commit()
-            return {
-                "inserted": len(to_insert),
-                "skipped": len(segs) - len(to_insert),
-                "stale_windows": stale,
-            }
-        except BaseException:
-            conn.rollback()
-            raise
+        stale = _mark_stale_windows(conn, to_insert)
+        return {
+            "inserted": len(to_insert),
+            "skipped": len(segs) - len(to_insert),
+            "stale_windows": stale,
+        }
+        # 任何异常都由 write_transaction 上下文统一回滚,库状态不变
 
 
 def _mark_stale_windows(conn, new_segments: list) -> list:
@@ -319,43 +313,36 @@ def _mark_stale_windows(conn, new_segments: list) -> list:
 def publish(db, station: str, window_start_ms: int) -> dict:
     if window_start_ms % WINDOW_MS != 0:
         raise BatchRejected("窗口起点须按 UTC 整 10 秒对齐")
-    with db.lock:
-        conn = db.conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            values, rounds = effective_window(
-                _fetch_segments(conn, station, window_start_ms,
-                                window_start_ms + WINDOW_MS),
-                window_start_ms)
-            filled = sum(v is not None for v in values)
-            if filled < WINDOW_SAMPLES:
-                raise IncompleteWindow(filled)  # 回滚,保留旧窗状态
-            now = _utc_now_iso()
-            row = conn.execute(
-                "SELECT version FROM windows WHERE station=? AND window_start_ms=?",
-                (station, window_start_ms)).fetchone()
-            version = row["version"] + 1 if row else 1
-            conn.execute(
-                "INSERT INTO windows(station,window_start_ms,state,samples,rounds,"
-                "version,published_at) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(station,window_start_ms) DO UPDATE SET "
-                "state='active', samples=excluded.samples, rounds=excluded.rounds, "
-                "version=excluded.version, published_at=excluded.published_at",
-                (station, window_start_ms, "active", _dumps(values),
-                 _dumps(rounds), version, now))
-            conn.commit()
-            return {"station": station, "window_start_ms": window_start_ms,
-                    "start_utc": ms_to_iso(window_start_ms), "state": "active",
-                    "version": version, "published_at": now}
-        except BaseException:
-            conn.rollback()
-            raise
+    with db.write_transaction() as conn:
+        values, rounds = effective_window(
+            _fetch_segments(conn, station, window_start_ms,
+                            window_start_ms + WINDOW_MS),
+            window_start_ms)
+        filled = sum(v is not None for v in values)
+        if filled < WINDOW_SAMPLES:
+            raise IncompleteWindow(filled)  # 回滚,保留旧窗状态
+        now = _utc_now_iso()
+        row = conn.execute(
+            "SELECT version FROM windows WHERE station=? AND window_start_ms=?",
+            (station, window_start_ms)).fetchone()
+        version = row["version"] + 1 if row else 1
+        conn.execute(
+            "INSERT INTO windows(station,window_start_ms,state,samples,rounds,"
+            "version,published_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(station,window_start_ms) DO UPDATE SET "
+            "state='active', samples=excluded.samples, rounds=excluded.rounds, "
+            "version=excluded.version, published_at=excluded.published_at",
+            (station, window_start_ms, "active", _dumps(values),
+             _dumps(rounds), version, now))
+        return {"station": station, "window_start_ms": window_start_ms,
+                "start_utc": ms_to_iso(window_start_ms), "state": "active",
+                "version": version, "published_at": now}
 
 
 def get_picking(db, station: str, window_start_ms: int):
     """拾取接口:仅现役(active)窗可读;stale 窗不再当作现役。"""
-    with db.lock:
-        row = db.conn.execute(
+    with db.read_transaction() as conn:
+        row = conn.execute(
             "SELECT state, samples, rounds, version, published_at FROM windows "
             "WHERE station=? AND window_start_ms=?",
             (station, window_start_ms)).fetchone()
@@ -372,16 +359,17 @@ def get_picking(db, station: str, window_start_ms: int):
 
 
 def list_stations(db) -> list:
-    with db.lock:
-        rows = db.conn.execute(
+    with db.read_transaction() as conn:
+        rows = conn.execute(
             "SELECT station FROM segments UNION SELECT station FROM windows "
             "ORDER BY 1").fetchall()
         return [r["station"] for r in rows]
 
 
 def list_windows(db, station: str, lo_ms: int, hi_ms: int) -> list:
-    with db.lock:
-        conn = db.conn
+    """缺口列表:segments 与 windows 的读取在同一个读事务(同一快照)内完成,
+    保证每个窗口的有效样点/缺口统计与窗状态、版本来自同一已提交状态。"""
+    with db.read_transaction() as conn:
         segs = _fetch_segments(conn, station, lo_ms, hi_ms)
         rows = conn.execute(
             "SELECT window_start_ms, state, version FROM windows "
@@ -403,8 +391,9 @@ def list_windows(db, station: str, lo_ms: int, hi_ms: int) -> list:
 
 
 def window_detail(db, station: str, window_start_ms: int) -> dict:
-    with db.lock:
-        conn = db.conn
+    """窗口详情:有效样点、逐样点来源轮次、缺口区间与窗状态/版本在同一个
+    读事务(同一快照)内计算,跨实例补传/发布交错时不会混报。"""
+    with db.read_transaction() as conn:
         values, rounds = effective_window(
             _fetch_segments(conn, station, window_start_ms,
                             window_start_ms + WINDOW_MS),

@@ -1,9 +1,12 @@
 """波形交接台自测:重叠、补传、幂等、原子性、窗状态机、交错一致性。"""
+import json
+import sqlite3
 import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core import SAMPLE_MS, WINDOW_SAMPLES
 from app.main import create_app
 
 W0 = 1_700_000_000_000  # 整 10 秒对齐的窗起点(epoch 毫秒)
@@ -339,3 +342,243 @@ def test_interleaved_upload_publish_read_consistency(client):
     d = picking(client).json()
     assert d["samples"] == [2] * 1000
     assert d["rounds"] == [2] * 1000
+
+
+# ---------------------------------------------------------------- 跨实例(跨连接)一致性
+#
+# 两个服务实例 = 同一 SQLite 文件上的两个独立连接。下列测试用第二个
+# 原始连接扮演"另一台实例",在查询请求的多次 SELECT 之间插入已提交的
+# 上传/发布,验证缺口列表与详情返回的统计、样点/轮次、窗状态与版本
+# 必须来自同一个已提交状态。
+
+@pytest.fixture()
+def peer_conn(tmp_path):
+    """扮演另一台服务实例的独立连接(独立进程即独立连接)。
+
+    check_same_thread=False:确定性测试的注入钩子运行在 TestClient 的
+    portal 线程,而连接在测试主线程创建;真实多进程场景各自单线程连接,
+    不受此参数影响。
+    """
+    other = sqlite3.connect(str(tmp_path / "test.db"),
+                            isolation_level=None, check_same_thread=False)
+    other.row_factory = sqlite3.Row
+    other.execute("PRAGMA busy_timeout=5000")
+    yield other
+    other.close()
+
+
+def _peer_insert(other, rnd, no, start_ms, values):
+    other.execute("BEGIN IMMEDIATE")
+    other.execute(
+        "INSERT INTO segments(station,round,segment_no,start_ms,n,samples,"
+        "content_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (STA, rnd, no, start_ms, len(values), json.dumps(values),
+         f"h{rnd}-{no}", "t"))
+    other.commit()
+
+
+def _peer_publish(other, version, values, rounds):
+    other.execute("BEGIN IMMEDIATE")
+    other.execute(
+        "INSERT INTO windows(station,window_start_ms,state,samples,rounds,"
+        "version,published_at) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(station,window_start_ms) DO UPDATE SET "
+        "state='active', samples=excluded.samples, rounds=excluded.rounds, "
+        "version=excluded.version, published_at=excluded.published_at",
+        (STA, W0, "active", json.dumps(values), json.dumps(rounds),
+         version, "t"))
+    other.commit()
+
+
+def test_list_query_pins_single_snapshot_across_peer_commit(client, peer_conn):
+    """列表查询两次 SELECT 之间,另一实例补齐并发布:不得报"现役窗只有500点"。"""
+    # 本实例先入库 500 点(窗未发布)
+    assert upload(client, row(STA, W0, 1, 0, [1] * 500)).status_code == 200
+
+    # 让对端的提交恰好发生在列表请求的 segments 查询之后、windows 查询之前
+    orig_fetch = __import__("app.core", fromlist=["_fetch_segments"])._fetch_segments
+
+    def fetch_then_peer_commits(conn, station, lo_ms, hi_ms):
+        out = orig_fetch(conn, station, lo_ms, hi_ms)
+        _peer_insert(peer_conn, 1, 1, W0 + 500 * SAMPLE_MS, [1] * 500)
+        _peer_publish(peer_conn, 1, [1] * 1000, [1] * 1000)
+        return out
+
+    __import__("app.core", fromlist=["_fetch_segments"])._fetch_segments = fetch_then_peer_commits
+    try:
+        w = windows(client)[0]
+    finally:
+        __import__("app.core", fromlist=["_fetch_segments"])._fetch_segments = orig_fetch
+
+    # 同一响应内的统计与状态必须自洽:现役窗必然 1000 点;
+    # 未发布(none)则必须仍是发布前的 500 点。两种都是合法的单一快照
+    if w["state"] == "active":
+        assert w["filled"] == 1000 and w["gaps"] == 0 and w["version"] == 1
+    else:
+        assert w["state"] == "none"
+        assert w["filled"] == 500 and w["gaps"] == 500 and w["version"] == 0
+    # 对端提交结束后,新请求必须看到最新已提交状态
+    latest = windows(client)[0]
+    assert latest["filled"] == 1000 and latest["gaps"] == 0
+    assert latest["state"] == "active" and latest["version"] == 1
+
+
+def test_detail_query_pins_single_snapshot_across_peer_commit(client, peer_conn):
+    """详情查询的样点/轮次与窗状态必须同快照;补传使现役窗过期时不得混报。"""
+    fill_window(client, 1, 1)
+    publish(client)  # 现役 v1:1000 点全来自轮次 1
+
+    orig_fetch = __import__("app.core", fromlist=["_fetch_segments"])._fetch_segments
+
+    def fetch_then_peer_stales(conn, station, lo_ms, hi_ms):
+        out = orig_fetch(conn, station, lo_ms, hi_ms)
+        # 另一实例高轮次补传前 100 点 -> 现役窗立即过期
+        _peer_insert(peer_conn, 2, 0, W0, [2] * 100)
+        peer_conn.execute("BEGIN IMMEDIATE")
+        peer_conn.execute(
+            "UPDATE windows SET state='stale' WHERE station=? AND window_start_ms=?",
+            (STA, W0))
+        peer_conn.commit()
+        return out
+
+    core_mod = __import__("app.core", fromlist=["_fetch_segments"])
+    core_mod._fetch_segments = fetch_then_peer_stales
+    try:
+        d = client.get(f"/api/windows/{STA}/{W0}").json()
+    finally:
+        core_mod._fetch_segments = orig_fetch
+
+    # 旧快照:active + 旧样点(全 1,全轮次 1);新快照:stale + 新样点(前100为2)
+    assert d["filled"] + d["gaps"] == WINDOW_SAMPLES
+    assert d["state"] in ("active", "stale")
+    if d["state"] == "active":
+        assert d["version"] == 1
+        assert d["samples"] == [1] * 1000
+        assert d["rounds"] == [1] * 1000
+    else:
+        assert d["samples"][:100] == [2] * 100
+        assert d["rounds"][:100] == [2] * 100
+        assert d["samples"][100:] == [1] * 900
+        assert d["rounds"][100:] == [1] * 900
+    # 再查一次必然是新快照
+    d2 = client.get(f"/api/windows/{STA}/{W0}").json()
+    assert d2["state"] == "stale"
+    assert d2["samples"][:100] == [2] * 100
+
+
+def test_read_transaction_does_not_block_peer_writer(client, peer_conn):
+    """查询持有读快照期间,另一实例的上传仍须及时完成(WAL 读写不互斥)。"""
+    fill_window(client, 1, 1)
+    publish(client)
+    write_finished = threading.Event()
+
+    def peer_write():
+        _peer_insert(peer_conn, 2, 0, W0, [2] * 100)  # 独立连接上的写事务
+        write_finished.set()
+
+    core_mod = __import__("app.core", fromlist=["_fetch_segments"])
+    orig_fetch = core_mod._fetch_segments
+
+    def hold_snapshot(conn, station, lo_ms, hi_ms):
+        out = orig_fetch(conn, station, lo_ms, hi_ms)
+        t = threading.Thread(target=peer_write)
+        t.start()
+        # 读事务尚未提交:给对端写事务留出充分时间完成
+        t.join(timeout=2.0)
+        return out
+
+    core_mod._fetch_segments = hold_snapshot
+    try:
+        d = client.get(f"/api/windows/{STA}/{W0}").json()
+    finally:
+        core_mod._fetch_segments = orig_fetch
+    assert d["state"] == "active"  # 读请求锚定写之前的快照,自洽即可
+    # 对端写事务在本读事务持有期间就已完成,未被读锁阻塞
+    assert write_finished.is_set()
+    # 读事务结束后,新请求可见对端已提交的 100 个高轮次样点(窗状态由
+    # 应用层上传流程维护,裸连接插入不会触发,这里只验证提交可见性)
+    latest = client.get(f"/api/windows/{STA}/{W0}").json()
+    assert latest["rounds"][:100] == [2] * 100
+    assert latest["samples"][:100] == [2] * 100
+    assert latest["state"] == "active"
+
+
+def test_two_app_instances_interleaved_consistency(tmp_path):
+    """两个独立 FastAPI 应用(两个连接,等价于两台实例)交错:
+    一台持续补传+发布,另一台及其自身并发查询列表/详情,全程不得出现
+    混合状态;写操作在查询压力下仍全部成功。"""
+    db_path = str(tmp_path / "shared.db")
+    app_a = create_app(db_path)
+    app_b = create_app(db_path)
+    with TestClient(app_a) as ca, TestClient(app_b) as cb:
+        # 初始:轮次 1 铺满并由实例 B 发布
+        assert upload(ca, row(STA, W0, 1, 0, [1] * 1000)).status_code == 200
+        assert publish(cb).status_code == 200
+
+        errors = []
+        stop = threading.Event()
+
+        def check_response(d):
+            # 不变式 1:统计自洽
+            if d["filled"] + d["gaps"] != WINDOW_SAMPLES:
+                errors.append(f"filled+gaps={d['filled'] + d['gaps']}")
+            # 不变式 2:样点与逐样点轮次一一对应(值==轮次),长度齐全
+            if len(d["samples"]) != WINDOW_SAMPLES or len(d["rounds"]) != WINDOW_SAMPLES:
+                errors.append("samples/rounds 长度异常")
+            if any(s != r for s, r in zip(d["samples"], d["rounds"])
+                   if r is not None):
+                errors.append("samples 与 rounds 来自不同提交状态")
+            # 不变式 3:已发布窗(active/stale)的有效样点必须是 1000,
+            # 绝不允许"现役窗只有 500 点"这类混合报告
+            if d["state"] in ("active", "stale") and d["filled"] != 1000:
+                errors.append(f"{d['state']} 窗 filled={d['filled']}(混合状态)")
+            if d["state"] in ("active", "stale") and d["version"] < 1:
+                errors.append("已发布窗版本号异常")
+            # 不变式 4:缺口区间与缺口数一致
+            covered = sum(b - a + 1 for a, b in d["gap_ranges"])
+            if covered != d["gaps"]:
+                errors.append("gap_ranges 与 gaps 不一致")
+
+        def writer():
+            try:
+                for rnd in range(2, 22):  # 20 轮补传+重新发布
+                    r = upload(ca, row(STA, W0, rnd, 0, [rnd] * 1000))
+                    assert r.status_code == 200, r.text
+                    p = publish(cb, wstart=W0)  # 发布走另一实例
+                    assert p.status_code == 200, p.text
+                    assert p.json()["version"] == rnd
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"writer: {e}")
+            finally:
+                stop.set()
+
+        def reader(client, name):
+            try:
+                while not stop.is_set():
+                    lw = windows(client)
+                    for w in lw:
+                        # 列表项也满足已发布窗必满点的自洽性
+                        if w["state"] in ("active", "stale") and w["filled"] != 1000:
+                            errors.append(f"{name} 列表混合状态: {w}")
+                        if w["filled"] + w["gaps"] != 1000:
+                            errors.append(f"{name} 列表统计不自洽: {w}")
+                    d = client.get(f"/api/windows/{STA}/{W0}")
+                    if d.status_code == 200:
+                        check_response(d.json())
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {e}")
+
+        threads = [threading.Thread(target=writer)]
+        threads += [threading.Thread(target=reader, args=(ca, f"A{i}")) for i in range(2)]
+        threads += [threading.Thread(target=reader, args=(cb, f"B{i}")) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), "线程超时未结束"
+        assert not errors, errors[:5]
+
+        # 收尾状态:实例 A 看到最终轮次 21 的现役窗
+        d = cb.get(f"/api/picking/{STA}/{W0}").json()
+        assert d["state"] == "active" and d["version"] == 21
+        assert d["samples"] == [21] * 1000 and d["rounds"] == [21] * 1000
